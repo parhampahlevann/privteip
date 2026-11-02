@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==============================================================================
-# GRETAP + Backhaul Reverse Tunnel Manager (With MSS 1240 & Iptables Forwarding)
-# Iran IP: 10.10.1.1/30 | Kharej IP: 10.10.1.2/30
+# GRETAP + Backhaul Reverse Tunnel Manager (v2.0 - Fixed & Hardened)
+# Iran IP: 10.10.1.1/30 | Kharej IP: 10.10.1.2/30 | MSS: 1240
 # ==============================================================================
 
 RED='\033[0;31m'
@@ -24,26 +24,34 @@ TUN_IR_IP="10.10.1.1"
 TUN_KH_IP="10.10.1.2"
 MSS_VAL="1240"
 
-# Check root
 if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}[ERROR] This script must be run as root!${NC}"
     exit 1
 fi
 
 install_dependencies() {
-    echo -e "${CYAN}[*] Installing required packages (iproute2, iptables, curl, tar)...${NC}"
+    echo -e "${CYAN}[*] Installing dependencies & tuning kernel parameters...${NC}"
     apt-get update -y -qq
     apt-get install -y iproute2 iptables curl wget tar -qq
+
+    # Enable IP forwarding & disable strict rp_filter for GRETAP stability
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+    sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
+    sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1
+
     if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
-        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+        cat <<EOF >> /etc/sysctl.conf
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
+EOF
     fi
 }
 
 install_backhaul_core() {
     mkdir -p "$CONFIG_DIR"
     if [[ -f "$BACKHAUL_BIN" ]]; then
-        echo -e "${GREEN}[+] Backhaul binary already exists.${NC}"
+        echo -e "${GREEN}[+] Backhaul binary already installed.${NC}"
         return
     fi
 
@@ -62,8 +70,8 @@ install_backhaul_core() {
     curl -L -s --connect-timeout 15 "$LATEST_URL" -o "/tmp/backhaul.tar.gz"
 
     if [[ ! -s "/tmp/backhaul.tar.gz" ]]; then
-        echo -e "${YELLOW}[!] Direct GitHub download failed or empty.${NC}"
-        read -p "Please enter custom direct download URL for Backhaul tar.gz (or press Enter to retry default): " CUSTOM_URL
+        echo -e "${YELLOW}[!] Direct GitHub download failed.${NC}"
+        read -p "Enter custom direct download URL for Backhaul tar.gz: " CUSTOM_URL
         if [[ -n "$CUSTOM_URL" ]]; then
             curl -L -s "$CUSTOM_URL" -o "/tmp/backhaul.tar.gz"
         fi
@@ -76,7 +84,7 @@ install_backhaul_core() {
         rm -f /tmp/backhaul.tar.gz
         echo -e "${GREEN}[+] Backhaul Core installed successfully.${NC}"
     else
-        echo -e "${RED}[!] Failed to extract Backhaul binary. Make sure /usr/local/bin/backhaul is placed manually if GitHub is blocked.${NC}"
+        echo -e "${RED}[!] Failed to extract Backhaul binary.${NC}"
         exit 1
     fi
 }
@@ -106,6 +114,7 @@ Requires=gretap-tunnel.service
 
 [Service]
 Type=simple
+ExecStartPre=/bin/sleep 2
 ExecStart=$BACKHAUL_BIN -c $BACKHAUL_TOML
 Restart=always
 RestartSec=3
@@ -140,7 +149,7 @@ setup_iran_server() {
     read -p "Select Backhaul Transport (tcp / tcpmux / ws) [default: tcp]: " BH_TRANS
     BH_TRANS=${BH_TRANS:-tcp}
 
-    echo -e "\n${YELLOW}[?] Enter ports to forward through the tunnel (comma-separated, e.g.: 1080,443,2053):${NC}"
+    echo -e "\n${YELLOW}[?] Enter ports to forward through the tunnel (comma-separated, e.g.: 1080,443,80):${NC}"
     read -p "Ports: " RAW_PORTS
     if [[ -z "$RAW_PORTS" ]]; then
         RAW_PORTS="1080,443"
@@ -149,16 +158,16 @@ setup_iran_server() {
     install_dependencies
     install_backhaul_core
 
-    # Clean spaces and format ports for Backhaul TOML and iptables
     CLEAN_PORTS=$(echo "$RAW_PORTS" | tr -d ' ')
     IFS=',' read -ra PORT_ARRAY <<< "$CLEAN_PORTS"
 
+    # Bind Backhaul ports on 10.10.1.1 and forward to Kharej local 127.0.0.1 (or 10.10.1.2)
     TOML_PORTS=""
     for p in "${PORT_ARRAY[@]}"; do
         if [[ -n "$TOML_PORTS" ]]; then
             TOML_PORTS+=", "
         fi
-        TOML_PORTS+="\"$p=$p\""
+        TOML_PORTS+="\"$TUN_IR_IP:$p=$p\""
     done
 
     # Create GRETAP UP script
@@ -170,13 +179,22 @@ ip addr add $TUN_IR_IP/30 dev gretap1
 ip link set gretap1 mtu 1400
 ip link set gretap1 up
 
-# Clamp MSS to $MSS_VAL
-iptables -t mangle -A FORWARD -o gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
-iptables -t mangle -A FORWARD -i gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
-iptables -t mangle -A OUTPUT -o gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
-iptables -t mangle -A INPUT -i gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
+# Disable rp_filter on gretap1
+sysctl -w net.ipv4.conf.gretap1.rp_filter=0 >/dev/null 2>&1
 
-# Port Forwarding via iptables to local Backhaul listener ($TUN_IR_IP)
+# Allow GRE protocol & all traffic on gretap1 (Prevents Connection Refused!)
+iptables -I INPUT 1 -p gre -j ACCEPT
+iptables -I INPUT 1 -i gretap1 -j ACCEPT
+iptables -I FORWARD 1 -i gretap1 -j ACCEPT
+iptables -I FORWARD 1 -o gretap1 -j ACCEPT
+
+# Clamp MSS to $MSS_VAL
+iptables -t mangle -I FORWARD 1 -o gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
+iptables -t mangle -I FORWARD 1 -i gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
+iptables -t mangle -I OUTPUT 1 -o gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
+iptables -t mangle -I INPUT 1 -i gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
+
+# Port Forwarding via iptables DNAT to Backhaul listener on $TUN_IR_IP
 EOF
 
     for p in "${PORT_ARRAY[@]}"; do
@@ -194,6 +212,11 @@ EOF
     # Create GRETAP DOWN script
     cat <<EOF > "$GRETAP_DOWN_SH"
 #!/bin/bash
+iptables -D INPUT -p gre -j ACCEPT 2>/dev/null || true
+iptables -D INPUT -i gretap1 -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i gretap1 -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -o gretap1 -j ACCEPT 2>/dev/null || true
+
 iptables -t mangle -D FORWARD -o gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL 2>/dev/null || true
 iptables -t mangle -D FORWARD -i gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL 2>/dev/null || true
 iptables -t mangle -D OUTPUT -o gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL 2>/dev/null || true
@@ -215,10 +238,10 @@ EOF
 
     chmod +x "$GRETAP_SH" "$GRETAP_DOWN_SH"
 
-    # Create Backhaul Server Config bound to GRETAP IP (10.10.1.1)
+    # Bind Backhaul control channel to 0.0.0.0:$BH_PORT so 10.10.1.1:$BH_PORT never refuses connections
     cat <<EOF > "$BACKHAUL_TOML"
 [server]
-bind_addr = "$TUN_IR_IP:$BH_PORT"
+bind_addr = "0.0.0.0:$BH_PORT"
 transport = "$BH_TRANS"
 token = "$BH_TOKEN"
 keepalive_period = 75
@@ -237,10 +260,6 @@ EOF
     systemctl restart backhaul-tunnel.service
 
     echo -e "\n${GREEN}[✓] IRAN Server setup completed successfully!${NC}"
-    echo -e "${CYAN}GRETAP Local IP  :${NC} $TUN_IR_IP"
-    echo -e "${CYAN}GRETAP Remote IP :${NC} $TUN_KH_IP"
-    echo -e "${CYAN}MSS Clamping     :${NC} $MSS_VAL"
-    echo -e "${CYAN}Forwarded Ports  :${NC} $CLEAN_PORTS"
 }
 
 setup_kharej_client() {
@@ -267,7 +286,6 @@ setup_kharej_client() {
     install_dependencies
     install_backhaul_core
 
-    # Create GRETAP UP script
     cat <<EOF > "$GRETAP_SH"
 #!/bin/bash
 ip link del gretap1 2>/dev/null || true
@@ -276,16 +294,28 @@ ip addr add $TUN_KH_IP/30 dev gretap1
 ip link set gretap1 mtu 1400
 ip link set gretap1 up
 
+sysctl -w net.ipv4.conf.gretap1.rp_filter=0 >/dev/null 2>&1
+
+# Allow GRE & GRETAP traffic through firewall
+iptables -I INPUT 1 -p gre -j ACCEPT
+iptables -I INPUT 1 -i gretap1 -j ACCEPT
+iptables -I FORWARD 1 -i gretap1 -j ACCEPT
+iptables -I FORWARD 1 -o gretap1 -j ACCEPT
+
 # Clamp MSS to $MSS_VAL
-iptables -t mangle -A FORWARD -o gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
-iptables -t mangle -A FORWARD -i gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
-iptables -t mangle -A OUTPUT -o gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
-iptables -t mangle -A INPUT -i gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
+iptables -t mangle -I FORWARD 1 -o gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
+iptables -t mangle -I FORWARD 1 -i gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
+iptables -t mangle -I OUTPUT 1 -o gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
+iptables -t mangle -I INPUT 1 -i gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
 EOF
 
-    # Create GRETAP DOWN script
     cat <<EOF > "$GRETAP_DOWN_SH"
 #!/bin/bash
+iptables -D INPUT -p gre -j ACCEPT 2>/dev/null || true
+iptables -D INPUT -i gretap1 -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i gretap1 -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -o gretap1 -j ACCEPT 2>/dev/null || true
+
 iptables -t mangle -D FORWARD -o gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL 2>/dev/null || true
 iptables -t mangle -D FORWARD -i gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL 2>/dev/null || true
 iptables -t mangle -D OUTPUT -o gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL 2>/dev/null || true
@@ -295,7 +325,6 @@ EOF
 
     chmod +x "$GRETAP_SH" "$GRETAP_DOWN_SH"
 
-    # Create Backhaul Client Config connecting to Iran GRETAP IP (10.10.1.1)
     cat <<EOF > "$BACKHAUL_TOML"
 [client]
 remote_addr = "$TUN_IR_IP:$BH_PORT"
@@ -316,9 +345,6 @@ EOF
     systemctl restart backhaul-tunnel.service
 
     echo -e "\n${GREEN}[✓] KHAREJ Client setup completed successfully!${NC}"
-    echo -e "${CYAN}GRETAP Local IP       :${NC} $TUN_KH_IP"
-    echo -e "${CYAN}Backhaul Target (Iran):${NC} $TUN_IR_IP:$BH_PORT"
-    echo -e "${CYAN}MSS Clamping          :${NC} $MSS_VAL"
 }
 
 show_status() {
@@ -337,9 +363,10 @@ show_status() {
         ping -c 2 -W 2 "$TUN_IR_IP" >/dev/null 2>&1 && echo -e "    Ping to $TUN_IR_IP: ${GREEN}SUCCESS${NC}" || echo -e "    Ping to $TUN_IR_IP: ${RED}FAILED${NC}"
     fi
 
-    echo -e "\n${CYAN}[*] Backhaul Service Status:${NC}"
+    echo -e "\n${CYAN}[*] Backhaul Service & Listening Ports:${NC}"
     if systemctl is-active --quiet backhaul-tunnel.service; then
         echo -e "    Service: ${GREEN}ACTIVE (RUNNING)${NC}"
+        ss -tulnp | grep backhaul | awk '{print "    Listening: " $5}'
     else
         echo -e "    Service: ${RED}INACTIVE / FAILED${NC}"
     fi
@@ -359,7 +386,7 @@ add_new_ports() {
         return
     fi
 
-    read -p "Enter new comma-separated ports to replace/update (e.g. 1080,443,8443): " NEW_PORTS
+    read -p "Enter new comma-separated ports (e.g. 1080,443,80): " NEW_PORTS
     if [[ -z "$NEW_PORTS" ]]; then
         echo -e "${RED}[!] No ports entered.${NC}"
         return
@@ -373,17 +400,14 @@ add_new_ports() {
         if [[ -n "$TOML_PORTS" ]]; then
             TOML_PORTS+=", "
         fi
-        TOML_PORTS+="\"$p=$p\""
+        TOML_PORTS+="\"$TUN_IR_IP:$p=$p\""
     done
 
-    # Stop tunnel to clean old iptables rules
     systemctl stop gretap-tunnel.service
 
-    # Remove old DNAT rules from scripts
     sed -i '/DNAT --to-destination/d' "$GRETAP_SH"
     sed -i '/DNAT --to-destination/d' "$GRETAP_DOWN_SH"
 
-    # Insert new DNAT rules into gretap-up.sh and gretap-down.sh
     for p in "${PORT_ARRAY[@]}"; do
         echo "iptables -t nat -A PREROUTING -p tcp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p" >> "$GRETAP_SH"
         echo "iptables -t nat -A PREROUTING -p udp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p" >> "$GRETAP_SH"
@@ -391,7 +415,6 @@ add_new_ports() {
         echo "iptables -t nat -D PREROUTING -p udp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p 2>/dev/null || true" >> "$GRETAP_DOWN_SH"
     done
 
-    # Update TOML ports
     sed -i '/ports = \[/,/\]/c\ports = [\n    '"$TOML_PORTS"'\n]' "$BACKHAUL_TOML"
 
     systemctl start gretap-tunnel.service
@@ -416,7 +439,7 @@ uninstall_all() {
 main_menu() {
     clear
     echo -e "${CYAN}========================================================${NC}"
-    echo -e "${GREEN}   GRETAP + Backhaul Reverse Tunnel Installer (MSS 1240)${NC}"
+    echo -e "${GREEN}   GRETAP + Backhaul Reverse Tunnel Manager v2.0        ${NC}"
     echo -e "${CYAN}   Iran: 10.10.1.1/30  <--->  Kharej: 10.10.1.2/30      ${NC}"
     echo -e "${CYAN}========================================================${NC}"
     echo -e " 1) Configure ${GREEN}IRAN Server${NC} (GRETAP + Backhaul Server + Iptables)"
