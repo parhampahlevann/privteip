@@ -1,8 +1,27 @@
 #!/bin/bash
 
 # ==============================================================================
-# GRETAP + Backhaul Reverse Tunnel Manager (v2.0 - Fixed & Hardened)
+# GRETAP + Backhaul Reverse Tunnel Manager (v2.1 - Port-Forward Fix)
 # Iran IP: 10.10.1.1/30 | Kharej IP: 10.10.1.2/30 | MSS: 1240
+#
+# Changelog v2.1 (fixes the "ping works, forwarded ports don't" bug):
+#  - Forwarded ports (1080, 443, ...) arrive on the PUBLIC interface, not on
+#    gretap1. The old script only had "-i gretap1 -j ACCEPT" in INPUT, which
+#    never matches that traffic. On any box with a default DROP/REJECT INPUT
+#    policy (common on VPS firewalls), that silently killed every forwarded
+#    connection while ping and the Backhaul control channel (which really
+#    does arrive on gretap1) kept working fine. Added explicit
+#    "--dport <port> -j ACCEPT" INPUT rules for every forwarded port.
+#  - Added accept_udp = true to the server config: the script already DNATs
+#    UDP for every forwarded port, but Backhaul silently drops UDP unless
+#    this flag is set.
+#  - add_new_ports() now regenerates the INPUT accept rules too (all
+#    per-port rules are tagged with a "# BH-FWD" marker) so changing the
+#    port list doesn't leave stale or missing firewall rules behind.
+#  - setup_kharej_client() now prints a reminder: Backhaul's reverse tunnel
+#    forwards each port to 127.0.0.1:<same port> ON THE KHAREJ BOX. If
+#    nothing is listening there, the tunnel will be "up" but the forwarded
+#    connection will still fail/refuse on the Kharej side.
 # ==============================================================================
 
 RED='\033[0;31m'
@@ -195,12 +214,16 @@ iptables -t mangle -I OUTPUT 1 -o gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN 
 iptables -t mangle -I INPUT 1 -i gretap1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_VAL
 
 # Port Forwarding via iptables DNAT to Backhaul listener on $TUN_IR_IP
+# NOTE: this traffic arrives on the PUBLIC interface, NOT on gretap1, so it
+# needs its own explicit INPUT accept rules (that's the v2.0 bug - see below).
 EOF
 
     for p in "${PORT_ARRAY[@]}"; do
         cat <<EOF >> "$GRETAP_SH"
-iptables -t nat -A PREROUTING -p tcp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p
-iptables -t nat -A PREROUTING -p udp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p
+iptables -t nat -A PREROUTING -p tcp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p # BH-FWD
+iptables -t nat -A PREROUTING -p udp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p # BH-FWD
+iptables -I INPUT 1 -p tcp --dport $p -j ACCEPT # BH-FWD
+iptables -I INPUT 1 -p udp --dport $p -j ACCEPT # BH-FWD
 EOF
     done
 
@@ -225,8 +248,10 @@ EOF
 
     for p in "${PORT_ARRAY[@]}"; do
         cat <<EOF >> "$GRETAP_DOWN_SH"
-iptables -t nat -D PREROUTING -p tcp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p 2>/dev/null || true
-iptables -t nat -D PREROUTING -p udp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p 2>/dev/null || true
+iptables -D INPUT -p tcp --dport $p -j ACCEPT 2>/dev/null || true # BH-FWD
+iptables -D INPUT -p udp --dport $p -j ACCEPT 2>/dev/null || true # BH-FWD
+iptables -t nat -D PREROUTING -p tcp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p 2>/dev/null || true # BH-FWD
+iptables -t nat -D PREROUTING -p udp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p 2>/dev/null || true # BH-FWD
 EOF
     done
 
@@ -243,6 +268,7 @@ EOF
 [server]
 bind_addr = "0.0.0.0:$BH_PORT"
 transport = "$BH_TRANS"
+accept_udp = true
 token = "$BH_TOKEN"
 keepalive_period = 75
 nodelay = true
@@ -345,6 +371,9 @@ EOF
     systemctl restart backhaul-tunnel.service
 
     echo -e "\n${GREEN}[✓] KHAREJ Client setup completed successfully!${NC}"
+    echo -e "${YELLOW}[i] Reminder: Backhaul forwards each tunneled port to 127.0.0.1:<same-port> ON THIS (Kharej) MACHINE.${NC}"
+    echo -e "${YELLOW}    If nothing is listening there (e.g. a SOCKS proxy on 127.0.0.1:1080), the tunnel will be up${NC}"
+    echo -e "${YELLOW}    but the forwarded connection will still fail/refuse. Make sure your target service is running first.${NC}"
 }
 
 show_status() {
@@ -377,6 +406,9 @@ show_status() {
     echo -e "\n${CYAN}[*] Active MSS & NAT Iptables Rules:${NC}"
     iptables -t mangle -S | grep "1240" || echo "    No MSS rules found."
     iptables -t nat -S PREROUTING | grep "$TUN_IR_IP" || echo "    No DNAT port forwarding rules on this node."
+
+    echo -e "\n${CYAN}[*] Forwarded-Port INPUT Accept Rules (Iran server only):${NC}"
+    iptables -S INPUT | grep "BH-FWD" || echo "    None found (normal on the Kharej client)."
     echo -e "${CYAN}===============================================${NC}\n"
 }
 
@@ -405,14 +437,23 @@ add_new_ports() {
 
     systemctl stop gretap-tunnel.service
 
-    sed -i '/DNAT --to-destination/d' "$GRETAP_SH"
-    sed -i '/DNAT --to-destination/d' "$GRETAP_DOWN_SH"
+    # Remove every previously generated per-port rule (DNAT + INPUT accept) in one shot
+    sed -i '/# BH-FWD/d' "$GRETAP_SH"
+    sed -i '/# BH-FWD/d' "$GRETAP_DOWN_SH"
 
     for p in "${PORT_ARRAY[@]}"; do
-        echo "iptables -t nat -A PREROUTING -p tcp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p" >> "$GRETAP_SH"
-        echo "iptables -t nat -A PREROUTING -p udp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p" >> "$GRETAP_SH"
-        echo "iptables -t nat -D PREROUTING -p tcp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p 2>/dev/null || true" >> "$GRETAP_DOWN_SH"
-        echo "iptables -t nat -D PREROUTING -p udp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p 2>/dev/null || true" >> "$GRETAP_DOWN_SH"
+        {
+            echo "iptables -t nat -A PREROUTING -p tcp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p # BH-FWD"
+            echo "iptables -t nat -A PREROUTING -p udp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p # BH-FWD"
+            echo "iptables -I INPUT 1 -p tcp --dport $p -j ACCEPT # BH-FWD"
+            echo "iptables -I INPUT 1 -p udp --dport $p -j ACCEPT # BH-FWD"
+        } >> "$GRETAP_SH"
+        {
+            echo "iptables -D INPUT -p tcp --dport $p -j ACCEPT 2>/dev/null || true # BH-FWD"
+            echo "iptables -D INPUT -p udp --dport $p -j ACCEPT 2>/dev/null || true # BH-FWD"
+            echo "iptables -t nat -D PREROUTING -p tcp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p 2>/dev/null || true # BH-FWD"
+            echo "iptables -t nat -D PREROUTING -p udp ! -s $TUN_KH_IP --dport $p -j DNAT --to-destination $TUN_IR_IP:$p 2>/dev/null || true # BH-FWD"
+        } >> "$GRETAP_DOWN_SH"
     done
 
     sed -i '/ports = \[/,/\]/c\ports = [\n    '"$TOML_PORTS"'\n]' "$BACKHAUL_TOML"
@@ -439,7 +480,7 @@ uninstall_all() {
 main_menu() {
     clear
     echo -e "${CYAN}========================================================${NC}"
-    echo -e "${GREEN}   GRETAP + Backhaul Reverse Tunnel Manager v2.0        ${NC}"
+    echo -e "${GREEN}   GRETAP + Backhaul Reverse Tunnel Manager v2.1        ${NC}"
     echo -e "${CYAN}   Iran: 10.10.1.1/30  <--->  Kharej: 10.10.1.2/30      ${NC}"
     echo -e "${CYAN}========================================================${NC}"
     echo -e " 1) Configure ${GREEN}IRAN Server${NC} (GRETAP + Backhaul Server + Iptables)"
